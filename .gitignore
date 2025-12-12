@@ -1,0 +1,10 @@
+DS_Store 
+
+week4
+
+data
+
+__pycache__
+*.pyc
+*.pyo
+*.pyd
