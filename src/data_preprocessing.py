@@ -1,200 +1,185 @@
-import pandas as pd
-import numpy as np
+# preprocessing.py
 
+import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
-from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import (
+    OneHotEncoder,
+    LabelEncoder,
+    StandardScaler,
+    MinMaxScaler
+)
+
+from xverse.transformer import WOE
+
 
 
 # -------------------------------------------------------------
 # 1. CUSTOMER-LEVEL AGGREGATION
 # -------------------------------------------------------------
-class CustomerAggregator(BaseEstimator, TransformerMixin):
+class AggregateFeatures(BaseEstimator, TransformerMixin):
     """
-    Aggregates transaction-level data into customer-level features.
+    Creates customer-level aggregate transaction features.
     """
-    def __init__(self, customer_id='SubscriptionId', amount_col='Amount', value_col='Value'):
-        self.customer_id = customer_id
+
+    def __init__(self, customer_id_col, amount_col):
+        self.customer_id_col = customer_id_col
         self.amount_col = amount_col
-        self.value_col = value_col
 
     def fit(self, X, y=None):
         return self
 
     def transform(self, X):
-        df = X.copy()
+        agg_df = (
+            X.groupby(self.customer_id_col)[self.amount_col]
+            .agg(
+                total_transaction_amount='sum',
+                average_transaction_amount='mean',
+                transaction_count='count',
+                std_transaction_amount='std'
+            )
+            .reset_index()
+        )
 
-        df[self.amount_col] = pd.to_numeric(df[self.amount_col], errors='coerce')
-        df[self.value_col] = pd.to_numeric(df[self.value_col], errors='coerce')
-
-        group = df.groupby(self.customer_id)
-
-        agg = pd.DataFrame({
-            "SubscriptionId": group.size().index,
-            "total_amount": group[self.amount_col].sum().values,
-            "avg_amount": group[self.amount_col].mean().values,
-            "std_amount": group[self.amount_col].std().fillna(0).values,
-            "count_tx": group.size().values,
-            "total_value": group[self.value_col].sum().values,
-            "avg_value": group[self.value_col].mean().values,
-        })
-
-        return agg.fillna(0)
+        return agg_df
 
 
 # -------------------------------------------------------------
 # 2. DATE FEATURE EXTRACTION
 # -------------------------------------------------------------
-class DateFeatureAggregator(BaseEstimator, TransformerMixin):
+class DateFeatureExtractor(BaseEstimator, TransformerMixin):
     """
-    Extracts date features (hour/day/month/weekdays) and aggregates per customer.
+    Extracts hour, day, month, year from datetime column.
     """
-    def __init__(self, customer_id="SubscriptionId", date_col="TransactionDate"):
-        self.customer_id = customer_id
+
+    def __init__(self, date_col):
         self.date_col = date_col
 
     def fit(self, X, y=None):
         return self
 
     def transform(self, X):
-        df = X.copy()
-        df[self.date_col] = pd.to_datetime(df[self.date_col], errors='coerce')
+        X = X.copy()
+        X[self.date_col] = pd.to_datetime(X[self.date_col])
 
-        df["tx_hour"] = df[self.date_col].dt.hour
-        df["tx_day"] = df[self.date_col].dt.day
-        df["tx_month"] = df[self.date_col].dt.month
-        df["tx_weekday"] = df[self.date_col].dt.weekday
+        X['transaction_hour'] = X[self.date_col].dt.hour
+        X['transaction_day'] = X[self.date_col].dt.day
+        X['transaction_month'] = X[self.date_col].dt.month
+        X['transaction_year'] = X[self.date_col].dt.year
 
-        grp = df.groupby(self.customer_id)
-
-        agg = pd.DataFrame({
-            "SubscriptionId": grp.size().index,
-            "mean_hour": grp["tx_hour"].mean().values,
-            "unique_days": grp["tx_day"].nunique().values,
-            "unique_months": grp["tx_month"].nunique().values,
-            "weekday_var": grp["tx_weekday"].var().fillna(0).values,
-        })
-
-        return agg.fillna(0)
-
-
+        return X.drop(columns=[self.date_col])
 # -------------------------------------------------------------
-# 3. WEIGHT OF EVIDENCE (WOE) + INFORMATION VALUE (IV)
+# 3. Removing Outliers
 # -------------------------------------------------------------
-class WOETransformer(BaseEstimator, TransformerMixin):
+class OutlierRemover(BaseEstimator, TransformerMixin):
     """
-    Computes WOE and transforms categorical variables.
+    Removes outliers using the IQR method for numerical features.
     """
-    def __init__(self, categorical_cols=None, replace_missing="MISSING"):
-        self.categorical_cols = categorical_cols
-        self.replace_missing = replace_missing
-        self.woe_map_ = {}
-        self.iv_dict_ = {}
 
-    def _calculate_woe_iv(self, feature, y):
-        df = pd.DataFrame({"x": feature.fillna(self.replace_missing), "y": y})
-        g = df.groupby("x").agg(bad=("y", "sum"), total=("y", "count"))
-        g["good"] = g["total"] - g["bad"]
+    def __init__(self, numeric_cols, factor=1.5):
+        self.numeric_cols = numeric_cols
+        self.factor = factor
+        self.bounds_ = {}
 
-        # Avoid division by zero
-        g["bad_rate"] = (g["bad"] + 0.5) / g["bad"].sum()
-        g["good_rate"] = (g["good"] + 0.5) / g["good"].sum()
+    def fit(self, X, y=None):
+        for col in self.numeric_cols:
+            Q1 = X[col].quantile(0.25)
+            Q3 = X[col].quantile(0.75)
+            IQR = Q3 - Q1
 
-        g["woe"] = np.log(g["good_rate"] / g["bad_rate"])
-        g["iv"] = (g["good_rate"] - g["bad_rate"]) * g["woe"]
+            lower = Q1 - self.factor * IQR
+            upper = Q3 + self.factor * IQR
 
-        return g["woe"].to_dict(), g["iv"].sum()
-
-    def fit(self, X, y):
-        if self.categorical_cols is None:
-            self.categorical_cols = X.columns.tolist()
-
-        for col in self.categorical_cols:
-            mapping, iv = self._calculate_woe_iv(X[col], y)
-            self.woe_map_[col] = mapping
-            self.iv_dict_[col] = iv
+            self.bounds_[col] = (lower, upper)
 
         return self
 
     def transform(self, X):
         X = X.copy()
-        for col in self.categorical_cols:
-            X[col] = (
-                X[col].fillna(self.replace_missing)
-                .map(self.woe_map_[col])
-                .fillna(0.0)
-            )
+
+        for col, (lower, upper) in self.bounds_.items():
+            X = X[(X[col] >= lower) & (X[col] <= upper)]
+
         return X
 
 
 # -------------------------------------------------------------
-# 4. BUILD FULL FEATURESET (MERGING EVERYTHING)
+# 4. Feature Engineering with WoE and IV
 # -------------------------------------------------------------
-def build_customer_features(df):
+class WoEFeatureEngineer(BaseEstimator, TransformerMixin):
     """
-    Combines:
-    - Customer aggregates
-    - Date feature aggregates
-    - Category mode per customer
-    Returns a customer-level dataframe.
+    Applies Weight of Evidence (WoE) transformation
+    and computes Information Value (IV).
     """
 
-    agg1 = CustomerAggregator().transform(df)
-    agg2 = DateFeatureAggregator().transform(df)
+    def __init__(self, iv_threshold=0.02, max_bins=5, min_bin_pct=0.05):
+        self.iv_threshold = iv_threshold
+        self.max_bins = max_bins
+        self.min_bin_pct = min_bin_pct
+        self.woe_ = None
 
-    customer_df = agg1.merge(agg2, on="SubscriptionId", how="left")
-
-    # Gather categorical mode (ProviderId, ProductId, etc.)
-    categorical_cols = ["ProviderId", "ProductId", "ProductCategory",
-                        "ChannelId", "PricingStrategy"]
-
-    for col in categorical_cols:
-        mode_series = (
-            df.groupby("SubscriptionId")[col]
-            .agg(lambda x: x.mode().iat[0] if not x.mode().empty else np.nan)
-            .reset_index()
+    def fit(self, X, y):
+        self.woe_ = WOE(
+            iv_threshold=self.iv_threshold,
+            max_bins=self.max_bins,
+            min_bin_pct=self.min_bin_pct
         )
-        customer_df = customer_df.merge(mode_series, on="SubscriptionId", how="left")
+        self.woe_.fit(X, y)
+        return self
 
-    return customer_df.fillna(0)
+    def transform(self, X):
+        return self.woe_.transform(X)
+
+    def get_iv_summary(self):
+        """
+        Returns Information Value (IV) for each feature.
+        """
+        return self.woe_.iv_df_
 
 
 # -------------------------------------------------------------
-# 5. BUILD FULL PIPELINE FOR MODELING
+# 5. build_feature_engineering_pipeline
 # -------------------------------------------------------------
-def build_model_pipeline(numeric_features, categorical_features):
+def build_feature_engineering_pipeline(
+    numeric_cols,
+    categorical_cols,
+    customer_id_col,
+    amount_col,
+    date_col,
+    scaling_method='standard',
+    use_woe=False,
+    remove_outliers=True
+):
     """
-    Builds an sklearn Pipeline using:
-    - WoE for categorical columns
-    - Standard scaling for numeric columns
+    Builds a full Task 3 feature engineering pipeline.
     """
-    preprocessor = ColumnTransformer(
+
+    scaler = (
+        StandardScaler() if scaling_method == 'standard'
+        else MinMaxScaler()
+    )
+
+    preprocessing = ColumnTransformer(
         transformers=[
-            ("num", StandardScaler(), numeric_features),
-            ("cat", "passthrough", categorical_features),  # WOE already numeric
-        ]
+            ('num', scaler, numeric_cols),
+            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_cols)
+        ],
+        remainder='drop'
     )
 
-    model_pipeline = Pipeline(
-        steps=[
-            ("preprocessor", preprocessor),
-        ]
-    )
+    steps = [
+        ('date_features', DateFeatureExtractor(date_col)),
+        ('aggregate_features', AggregateFeatures(customer_id_col, amount_col))
+    ]
 
-    return model_pipeline
+    if remove_outliers:
+        steps.append(('outlier_removal', OutlierRemover(numeric_cols)))
 
+    steps.append(('preprocessing', preprocessing))
 
-# -------------------------------------------------------------
-# 6. HELPER TO APPLY WOE + PIPELINE TO CUSTOMER DF
-# -------------------------------------------------------------
-def apply_woe(customer_df, target_col, categorical_cols):
-    woe = WOETransformer(categorical_cols=categorical_cols)
-    transformed = woe.fit_transform(customer_df[categorical_cols], customer_df[target_col])
+    # ⭐ THIS IS THE FEATURE ENGINEERING WITH WoE & IV ⭐
+    if use_woe:
+        steps.append(('woe', WoEFeatureEngineer()))
 
-    # insert back into customer_df
-    df_out = customer_df.copy()
-    for col in categorical_cols:
-        df_out[col] = transformed[col]
-
-    return df_out, woe
+    return Pipeline(steps)
