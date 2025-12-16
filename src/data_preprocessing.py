@@ -154,12 +154,23 @@ def build_feature_engineering_pipeline(
     """
     Builds a full Task 3 feature engineering pipeline.
     """
-
+    
+    # First create the aggregate features, then handle outliers
+    steps = [
+        ('date_features', DateFeatureExtractor(date_col)),
+        ('aggregate_features', AggregateFeatures(customer_id_col, amount_col))
+    ]
+    
+    # Outlier removal should come AFTER aggregation
+    if remove_outliers:
+        steps.append(('outlier_removal', OutlierRemover(numeric_cols)))
+    
+    # Then do preprocessing
     scaler = (
         StandardScaler() if scaling_method == 'standard'
         else MinMaxScaler()
     )
-
+    
     preprocessing = ColumnTransformer(
         transformers=[
             ('num', scaler, numeric_cols),
@@ -167,19 +178,11 @@ def build_feature_engineering_pipeline(
         ],
         remainder='drop'
     )
-
-    steps = [
-        ('date_features', DateFeatureExtractor(date_col)),
-        ('aggregate_features', AggregateFeatures(customer_id_col, amount_col))
-    ]
-
-    if remove_outliers:
-        steps.append(('outlier_removal', OutlierRemover(numeric_cols)))
-
+    
     steps.append(('preprocessing', preprocessing))
-
-    # ⭐ THIS IS THE FEATURE ENGINEERING WITH WoE & IV ⭐
+    
+    # WoE if needed
     if use_woe:
         steps.append(('woe', WoEFeatureEngineer()))
-
+    
     return Pipeline(steps)
