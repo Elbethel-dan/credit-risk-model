@@ -1,4 +1,9 @@
-# preprocessing.py
+# data_preprocessing.py
+"""
+Feature Engineering Pipeline for Credit Risk Modeling
+Includes: Aggregate Features, Date Extraction, Encoding, Scaling, and WoE/IV
+"""
+
 import pandas as pd
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
@@ -11,15 +16,92 @@ from sklearn.preprocessing import (
 )
 from xverse.transformer import WOE
 
+
 # -------------------------------------------------------------
-# 1. DATE FEATURE EXTRACTION
+# 1. CUSTOMER AGGREGATION FEATURES
 # -------------------------------------------------------------
-class DateFeatureExtractor(BaseEstimator, TransformerMixin):
+class AggregateFeatures(BaseEstimator, TransformerMixin):
     """
-    Extracts date features from datetime column.
+    Creates customer-level aggregate features from transaction data.
+    """
+
+    def __init__(self, customer_id_col, amount_col, 
+                 categorical_cols=None, numeric_cols=None):
+        """
+        Parameters:
+        -----------
+        customer_id_col : str, column name for customer identifier
+        amount_col : str, column name for transaction amount
+        categorical_cols : list, categorical columns to preserve
+        numeric_cols : list, numeric columns to preserve
+        """
+        self.customer_id_col = customer_id_col
+        self.amount_col = amount_col
+        self.categorical_cols = categorical_cols or []
+        self.numeric_cols = numeric_cols or []
+        self.feature_names_ = None
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        X = X.copy()
+        
+        # Prepare aggregation dictionary
+        agg_dict = {}
+        
+        # 1. Amount statistics
+        agg_dict[self.amount_col] = ['sum', 'mean', 'count', 'std', 'min', 'max', 'median']
+        
+        # 2. Categorical columns - take mode (most frequent)
+        for col in self.categorical_cols:
+            if col in X.columns and col != self.customer_id_col:
+                agg_dict[col] = lambda x: x.mode()[0] if not x.mode().empty else np.nan
+        
+        # 3. Other numeric columns - statistics
+        for col in self.numeric_cols:
+            if col in X.columns and col != self.amount_col and col != self.customer_id_col:
+                agg_dict[col] = ['mean', 'std', 'min', 'max', 'sum']
+        
+        # Perform aggregation
+        result = X.groupby(self.customer_id_col).agg(agg_dict)
+        
+        # Flatten multi-level columns
+        result.columns = ['_'.join(col).strip('_') for col in result.columns.values]
+        result = result.reset_index()
+        
+        # Create derived features
+        if f'{self.amount_col}_sum' in result.columns and f'{self.amount_col}_count' in result.columns:
+            # Average transaction value
+            result[f'{self.amount_col}_avg_value'] = (
+                result[f'{self.amount_col}_sum'] / result[f'{self.amount_col}_count']
+            )
+        
+        # Handle infinite values
+        result = result.replace([np.inf, -np.inf], np.nan)
+        
+        self.feature_names_ = result.columns.tolist()
+        
+        return result
+
+    def get_feature_names(self):
+        return self.feature_names_
+
+
+# -------------------------------------------------------------
+# 2. DATE FEATURE EXTRACTION
+# -------------------------------------------------------------
+class ExtractDateFeatures(BaseEstimator, TransformerMixin):
+    """
+    Extracts features from datetime columns.
     """
 
     def __init__(self, date_col):
+        """
+        Parameters:
+        -----------
+        date_col : str, column name for datetime
+        """
         self.date_col = date_col
         self.feature_names_ = None
 
@@ -62,152 +144,24 @@ class DateFeatureExtractor(BaseEstimator, TransformerMixin):
 
 
 # -------------------------------------------------------------
-# 2. CUSTOMER AGGREGATION FEATURES
+# 3. OUTLIER REMOVER (IQR Method)
 # -------------------------------------------------------------
-class CustomerAggregator(BaseEstimator, TransformerMixin):
-    """
-    Creates customer-level aggregate features from transaction data.
-    """
-
-    def __init__(self, customer_id_col, amount_col, 
-                 categorical_cols=None, numeric_cols=None):
-        self.customer_id_col = customer_id_col
-        self.amount_col = amount_col
-        self.categorical_cols = categorical_cols or []
-        self.numeric_cols = numeric_cols or []
-        self.feature_names_ = None
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-        
-        # Prepare aggregation dictionary
-        agg_dict = {}
-        
-        # 1. Basic amount statistics
-        agg_dict[self.amount_col] = ['sum', 'mean', 'count', 'std', 'min', 'max', 'median']
-        
-        # 2. Time between transactions (if date features exist)
-        date_cols = ['transaction_hour', 'transaction_day', 'transaction_month', 
-                    'transaction_year', 'transaction_dayofweek']
-        for col in date_cols:
-            if col in X.columns:
-                agg_dict[col] = ['mean', 'std', 'min', 'max']
-        
-        # 3. Categorical columns - mode (most frequent)
-        for col in self.categorical_cols:
-            if col in X.columns and col != self.customer_id_col:
-                agg_dict[col] = lambda x: x.mode()[0] if not x.mode().empty else np.nan
-        
-        # 4. Other numeric columns - statistics
-        for col in self.numeric_cols:
-            if col in X.columns and col != self.amount_col and col != self.customer_id_col:
-                agg_dict[col] = ['mean', 'std', 'min', 'max', 'sum']
-        
-        # Perform aggregation
-        result = X.groupby(self.customer_id_col).agg(agg_dict)
-        
-        # Flatten multi-level columns
-        result.columns = ['_'.join(col).strip('_') for col in result.columns.values]
-        result = result.reset_index()
-        
-        # Create derived features
-        if f'{self.amount_col}_sum' in result.columns and f'{self.amount_col}_count' in result.columns:
-            # Average transaction value
-            result[f'{self.amount_col}_avg_value'] = result[f'{self.amount_col}_sum'] / result[f'{self.amount_col}_count']
-            
-            # Transaction frequency features
-            if 'transaction_day_count' in result.columns:
-                result['days_between_transactions'] = result['transaction_day_count'] / result[f'{self.amount_col}_count']
-        
-        # Handle infinite values
-        result = result.replace([np.inf, -np.inf], np.nan)
-        
-        self.feature_names_ = result.columns.tolist()
-        
-        return result
-
-    def get_feature_names(self):
-        return self.feature_names_
-
-
-# -------------------------------------------------------------
-# 3. FEATURE ENGINEERING
-# -------------------------------------------------------------
-class FeatureEngineer(BaseEstimator, TransformerMixin):
-    """
-    Creates additional engineered features.
-    """
-
-    def __init__(self):
-        self.feature_names_ = None
-
-    def fit(self, X, y=None):
-        return self
-
-    def transform(self, X):
-        X = X.copy()
-        
-        # Amount-related features
-        amount_cols = [col for col in X.columns if 'Amount' in col and 'sum' in col]
-        for amount_col in amount_cols:
-            col_prefix = amount_col.replace('_sum', '')
-            
-            # Create ratio features if we have count
-            count_col = amount_col.replace('sum', 'count')
-            if count_col in X.columns:
-                X[f'{col_prefix}_avg_per_transaction'] = X[amount_col] / X[count_col]
-                
-                # Transaction frequency
-                if 'transaction_day_std' in X.columns:
-                    X[f'{col_prefix}_frequency_variability'] = X[count_col] / (X['transaction_day_std'] + 1)
-        
-        # Time pattern features
-        if 'transaction_hour_std' in X.columns:
-            X['transaction_time_consistency'] = 1 / (X['transaction_hour_std'] + 1)
-        
-        if 'transaction_dayofweek_std' in X.columns:
-            X['day_pattern_consistency'] = 1 / (X['transaction_dayofweek_std'] + 1)
-        
-        # Behavioral features
-        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-        for col in numeric_cols:
-            if '_std' in col:
-                mean_col = col.replace('_std', '_mean')
-                if mean_col in numeric_cols:
-                    X[f'{col.replace("_std", "")}_cv'] = X[col] / (X[mean_col] + 1e-10)  # Coefficient of variation
-        
-        # Fill NaN values
-        X = X.fillna(0)
-        
-        self.feature_names_ = X.columns.tolist()
-        
-        return X
-
-    def get_feature_names(self):
-        return self.feature_names_
-
-
-# -------------------------------------------------------------
-# 4. OUTLIER REMOVER (IQR Method)
-# -------------------------------------------------------------
-class OutlierRemover(BaseEstimator, TransformerMixin):
+class RemoveOutliers(BaseEstimator, TransformerMixin):
     """
     Removes outliers using IQR method.
     """
 
     def __init__(self, factor=1.5):
+        """
+        Parameters:
+        -----------
+        factor : float, IQR multiplier for outlier detection
+        """
         self.factor = factor
         self.bounds_ = {}
         self.feature_names_ = None
-        self.original_shape_ = None
 
     def fit(self, X, y=None):
-        self.original_shape_ = X.shape
-        
-        # Get numeric columns
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
         
         for col in numeric_cols:
@@ -237,8 +191,10 @@ class OutlierRemover(BaseEstimator, TransformerMixin):
         # Remove outliers
         X_clean = X[keep_mask].copy()
         
-        print(f"  Outlier removal: {len(X) - len(X_clean)} rows removed "
-              f"({((len(X) - len(X_clean)) / len(X) * 100):.1f}%)")
+        removed_count = len(X) - len(X_clean)
+        if removed_count > 0:
+            print(f"  Outlier removal: {removed_count} rows removed "
+                  f"({(removed_count / len(X) * 100):.1f}%)")
         
         return X_clean
 
@@ -247,64 +203,55 @@ class OutlierRemover(BaseEstimator, TransformerMixin):
 
 
 # -------------------------------------------------------------
-# 5. MISSING VALUE IMPUTER
+# 4. FEATURE ENGINEERING
 # -------------------------------------------------------------
-class MissingValueImputer(BaseEstimator, TransformerMixin):
+class FeatureEngineering(BaseEstimator, TransformerMixin):
     """
-    Imputes missing values.
+    Creates additional engineered features.
     """
 
-    def __init__(self, numeric_strategy='median', categorical_strategy='most_frequent'):
-        self.numeric_strategy = numeric_strategy
-        self.categorical_strategy = categorical_strategy
-        self.numeric_values_ = {}
-        self.categorical_values_ = {}
+    def __init__(self):
         self.feature_names_ = None
 
     def fit(self, X, y=None):
-        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-        categorical_cols = X.select_dtypes(exclude=[np.number]).columns.tolist()
-        
-        # Numeric imputation values
-        for col in numeric_cols:
-            if self.numeric_strategy == 'mean':
-                self.numeric_values_[col] = X[col].mean()
-            elif self.numeric_strategy == 'median':
-                self.numeric_values_[col] = X[col].median()
-            elif self.numeric_strategy == 'zero':
-                self.numeric_values_[col] = 
-        
-        # Categorical imputation values
-        for col in categorical_cols:
-            if self.categorical_strategy == 'most_frequent':
-                self.categorical_values_[col] = X[col].mode()[0] if not X[col].mode().empty else 'missing'
-            elif self.categorical_strategy == 'constant':
-                self.categorical_values_[col] = 'missing'
-        
-        self.feature_names_ = X.columns.tolist()
         return self
 
     def transform(self, X):
         X = X.copy()
         
-        # Count missing values before imputation
-        missing_before = X.isnull().sum().sum()
+        # Amount-related features
+        amount_cols = [col for col in X.columns if 'Amount' in col and 'sum' in col]
+        for amount_col in amount_cols:
+            col_prefix = amount_col.replace('_sum', '')
+            
+            # Create ratio features if we have count
+            count_col = amount_col.replace('sum', 'count')
+            if count_col in X.columns:
+                X[f'{col_prefix}_avg_per_transaction'] = X[amount_col] / X[count_col]
         
-        # Impute numeric columns
-        for col, value in self.numeric_values_.items():
-            if col in X.columns:
-                X[col] = X[col].fillna(value)
+        # Time pattern features
+        time_cols = [col for col in X.columns if any(time in col for time in ['hour', 'day', 'month', 'year'])]
+        for time_col in time_cols:
+            if '_std' in time_col:
+                # Calculate consistency metric
+                base_col = time_col.replace('_std', '')
+                mean_col = f'{base_col}_mean'
+                if mean_col in X.columns:
+                    X[f'{base_col}_consistency'] = 1 / (X[time_col] + 1)
         
-        # Impute categorical columns
-        for col, value in self.categorical_values_.items():
-            if col in X.columns:
-                X[col] = X[col].fillna(value)
+        # Behavioral features
+        numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
+        for col in numeric_cols:
+            if '_std' in col:
+                mean_col = col.replace('_std', '_mean')
+                if mean_col in numeric_cols:
+                    # Coefficient of variation
+                    X[f'{col.replace("_std", "")}_cv'] = X[col] / (X[mean_col] + 1e-10)
         
-        # Count missing values after imputation
-        missing_after = X.isnull().sum().sum()
+        # Fill any NaN values from calculations
+        X = X.fillna(0)
         
-        if missing_before > 0:
-            print(f"  Missing value imputation: {missing_before} values imputed")
+        self.feature_names_ = X.columns.tolist()
         
         return X
 
@@ -313,15 +260,22 @@ class MissingValueImputer(BaseEstimator, TransformerMixin):
 
 
 # -------------------------------------------------------------
-# 6. WOE TRANSFORMER (Weight of Evidence)
+# 5. WOE TRANSFORMER (Weight of Evidence & Information Value)
 # -------------------------------------------------------------
-class WoEFeatureEngineer(BaseEstimator, TransformerMixin):
+class WoEFeatureTransformer(BaseEstimator, TransformerMixin):
     """
-    Applies Weight of Evidence (WoE) transformation.
-    Can be used with or without target.
+    Applies Weight of Evidence (WoE) transformation and computes IV.
     """
 
     def __init__(self, target_col=None, iv_threshold=0.02, max_bins=5, min_bin_pct=0.05):
+        """
+        Parameters:
+        -----------
+        target_col : str, column name for target variable (optional)
+        iv_threshold : float, minimum IV to keep feature
+        max_bins : int, maximum number of bins
+        min_bin_pct : float, minimum percentage of observations per bin
+        """
         self.target_col = target_col
         self.iv_threshold = iv_threshold
         self.max_bins = max_bins
@@ -356,6 +310,7 @@ class WoEFeatureEngineer(BaseEstimator, TransformerMixin):
             self.woe_.fit(X, target)
             self.iv_summary_ = self.woe_.iv_df_ if hasattr(self.woe_, 'iv_df_') else None
             self.feature_names_ = X.columns.tolist()
+            print(f"✅ WoE fitting successful. {len(self.iv_summary_) if self.iv_summary_ is not None else 0} features processed.")
         except Exception as e:
             print(f"⚠️  WoE fitting failed: {e}. Skipping WoE.")
             self.woe_ = None
@@ -375,7 +330,7 @@ class WoEFeatureEngineer(BaseEstimator, TransformerMixin):
             transformed = self.woe_.transform(X)
             self.feature_names_ = transformed.columns.tolist()
             
-            print(f"  WoE transformation applied. IV summary available.")
+            print(f"✅ WoE transformation applied.")
             return transformed
         except Exception as e:
             print(f"⚠️  WoE transformation failed: {e}. Returning original features.")
@@ -392,7 +347,7 @@ class WoEFeatureEngineer(BaseEstimator, TransformerMixin):
 
 
 # -------------------------------------------------------------
-# 7. MAIN FEATURE ENGINEERING PIPELINE
+# 6. MAIN FEATURE ENGINEERING PIPELINE BUILDER
 # -------------------------------------------------------------
 def build_feature_engineering_pipeline(
     customer_id_col='CustomerId',
@@ -403,22 +358,22 @@ def build_feature_engineering_pipeline(
     use_woe=False,
     woe_target_col=None,
     remove_outliers=True,
-    handle_missing=True
+    scaling_method='standard'
 ):
     """
-    Builds complete feature engineering pipeline.
+    Builds complete feature engineering pipeline following Task 3 requirements.
     
     Parameters:
     -----------
     customer_id_col : str, column name for customer ID
     amount_col : str, column name for transaction amount
     date_col : str, column name for transaction date
-    categorical_cols : list, categorical columns to preserve
-    numeric_cols : list, numeric columns to preserve
+    categorical_cols : list, categorical columns to encode
+    numeric_cols : list, numeric columns to scale
     use_woe : bool, whether to apply WoE transformation
-    woe_target_col : str, target column name for WoE (optional)
+    woe_target_col : str, target column name for WoE
     remove_outliers : bool, whether to remove outliers
-    handle_missing : bool, whether to handle missing values
+    scaling_method : str, 'standard' or 'minmax'
     
     Returns:
     --------
@@ -434,10 +389,10 @@ def build_feature_engineering_pipeline(
     steps = []
     
     # Step 1: Extract date features
-    steps.append(('date_extractor', DateFeatureExtractor(date_col)))
+    steps.append(('extract_date_features', ExtractDateFeatures(date_col)))
     
     # Step 2: Customer aggregation
-    steps.append(('customer_aggregator', CustomerAggregator(
+    steps.append(('aggregate_features', AggregateFeatures(
         customer_id_col=customer_id_col,
         amount_col=amount_col,
         categorical_cols=categorical_cols,
@@ -445,154 +400,183 @@ def build_feature_engineering_pipeline(
     )))
     
     # Step 3: Feature engineering
-    steps.append(('feature_engineer', FeatureEngineer()))
+    steps.append(('feature_engineering', FeatureEngineering()))
     
-    # Step 4: Handle missing values
-    if handle_missing:
-        steps.append(('missing_imputer', MissingValueImputer()))
-    
-    # Step 5: Remove outliers
+    # Step 4: Remove outliers (optional)
     if remove_outliers:
-        steps.append(('outlier_remover', OutlierRemover()))
+        steps.append(('remove_outliers', RemoveOutliers()))
+    
+    # Step 5: Create preprocessing for encoding and scaling
+    # After aggregation, we need to identify which columns are numeric/categorical
+    # We'll create a ColumnTransformer that dynamically adapts
+    
+    # First, create a temporary transformer to get column types
+    class DynamicPreprocessor(BaseEstimator, TransformerMixin):
+        def __init__(self, scaling_method='standard'):
+            self.scaling_method = scaling_method
+            self.preprocessor_ = None
+            self.feature_names_ = None
+            
+        def fit(self, X, y=None):
+            # Identify column types
+            numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+            categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
+            
+            # Remove customer_id from features if present
+            customer_id_cols = [col for col in ['CustomerId', 'customer_id'] if col in categorical_features]
+            for col in customer_id_cols:
+                categorical_features.remove(col)
+            
+            # Create transformers
+            transformers = []
+            
+            if numeric_features:
+                scaler = StandardScaler() if self.scaling_method == 'standard' else MinMaxScaler()
+                transformers.append(('num', scaler, numeric_features))
+            
+            if categorical_features:
+                transformers.append(('cat', OneHotEncoder(
+                    handle_unknown='ignore',
+                    sparse_output=False,
+                    drop='first'
+                ), categorical_features))
+            
+            # Create ColumnTransformer
+            if transformers:
+                self.preprocessor_ = ColumnTransformer(
+                    transformers=transformers,
+                    remainder='drop'  # Drop other columns (like CustomerId)
+                )
+                self.preprocessor_.fit(X)
+                
+                # Get feature names after transformation
+                if hasattr(self.preprocessor_, 'get_feature_names_out'):
+                    self.feature_names_ = self.preprocessor_.get_feature_names_out()
+                else:
+                    # Fallback for older sklearn versions
+                    self.feature_names_ = []
+            
+            return self
+        
+        def transform(self, X):
+            if self.preprocessor_ is None:
+                return X
+            return self.preprocessor_.transform(X)
+        
+        def get_feature_names(self):
+            return self.feature_names_
+    
+    steps.append(('preprocessing', DynamicPreprocessor(scaling_method=scaling_method)))
     
     # Step 6: WoE transformation (optional)
     if use_woe:
-        steps.append(('woe_transformer', WoEFeatureEngineer(target_col=woe_target_col)))
+        steps.append(('woe_transformer', WoEFeatureTransformer(target_col=woe_target_col)))
     
     return Pipeline(steps)
 
 
 # -------------------------------------------------------------
-# 8. MODEL PREPROCESSING PIPELINE
+# 7. UTILITY FUNCTIONS
 # -------------------------------------------------------------
-def build_model_preprocessing_pipeline(
-    numeric_features=None,
-    categorical_features=None,
-    scaling_method='standard',
-    reduce_dimensions=False,
-    n_components=None
-):
+def get_feature_names_from_pipeline(pipeline, X_sample):
     """
-    Builds preprocessing pipeline for modeling.
+    Extract feature names from pipeline after transformation.
+    
+    Parameters:
+    -----------
+    pipeline : fitted Pipeline object
+    X_sample : DataFrame, sample data
+    
+    Returns:
+    --------
+    feature_names : list of feature names
     """
+    # Transform data through each step to get feature names
+    X_transformed = X_sample.copy()
+    feature_names = None
     
-    transformers = []
+    for step_name, transformer in pipeline.steps:
+        if hasattr(transformer, 'transform'):
+            X_transformed = transformer.transform(X_transformed)
+            if hasattr(transformer, 'get_feature_names'):
+                names = transformer.get_feature_names()
+                if names:
+                    feature_names = names
+            elif isinstance(X_transformed, pd.DataFrame):
+                feature_names = X_transformed.columns.tolist()
     
-    # Numeric preprocessing
-    if numeric_features and len(numeric_features) > 0:
-        scaler = StandardScaler() if scaling_method == 'standard' else MinMaxScaler()
-        transformers.append(('num', scaler, numeric_features))
-    
-    # Categorical preprocessing
-    if categorical_features and len(categorical_features) > 0:
-        transformers.append(('cat', OneHotEncoder(
-            handle_unknown='ignore',
-            sparse_output=False,
-            drop='first'
-        ), categorical_features))
-    
-    # Create ColumnTransformer
-    if transformers:
-        preprocessor = ColumnTransformer(
-            transformers=transformers,
-            remainder='passthrough'
-        )
-        
-        steps = [('preprocessor', preprocessor)]
-        
-        # Optional dimensionality reduction
-        if reduce_dimensions:
-            from sklearn.decomposition import PCA
-            if n_components is None:
-                steps.append(('pca', PCA(n_components=0.95)))  # Keep 95% variance
-            else:
-                steps.append(('pca', PCA(n_components=n_components)))
-        
-        return Pipeline(steps)
-    
-    return None
+    return feature_names
 
 
-# -------------------------------------------------------------
-# 9. UTILITY FUNCTIONS
-# -------------------------------------------------------------
-def get_feature_summary(X):
+def analyze_features(X, y=None):
     """
-    Get summary of engineered features.
-    """
-    summary = {
-        'total_features': X.shape[1],
-        'numeric_features': X.select_dtypes(include=[np.number]).shape[1],
-        'categorical_features': X.select_dtypes(exclude=[np.number]).shape[1],
-        'feature_names': X.columns.tolist(),
-        'missing_values': X.isnull().sum().sum(),
-        'data_shape': X.shape
-    }
-    return summary
-
-
-def analyze_feature_importance(X, y=None, method='correlation'):
-    """
-    Analyze feature importance using different methods.
+    Analyze engineered features.
     
     Parameters:
     -----------
     X : DataFrame, features
     y : Series, target (optional)
-    method : str, 'correlation', 'variance', or 'mutual_info'
     
     Returns:
     --------
-    importance_df : DataFrame with feature importance scores
+    analysis_dict : dictionary with analysis results
     """
+    analysis = {
+        'total_features': X.shape[1],
+        'numeric_features': X.select_dtypes(include=[np.number]).shape[1],
+        'categorical_features': X.select_dtypes(exclude=[np.number]).shape[1],
+        'feature_names': X.columns.tolist(),
+        'data_shape': X.shape,
+        'missing_values': X.isnull().sum().sum()
+    }
     
-    importance_df = pd.DataFrame({'feature': X.columns})
+    # Add variance analysis for numeric features
+    numeric_features = X.select_dtypes(include=[np.number])
+    if not numeric_features.empty:
+        variances = numeric_features.var().sort_values(ascending=False)
+        analysis['top_variance_features'] = variances.head(10).to_dict()
+        analysis['total_variance'] = variances.sum()
     
-    if method == 'correlation' and y is not None:
-        # Correlation with target
-        correlations = []
-        for col in X.columns:
-            if pd.api.types.is_numeric_dtype(X[col]):
-                corr = np.abs(X[col].corr(y))
-                correlations.append(corr if not pd.isna(corr) else 0)
-            else:
-                correlations.append(0)
-        importance_df['importance'] = correlations
-        importance_df['method'] = 'correlation'
+    # Add correlation analysis if target is provided
+    if y is not None and not numeric_features.empty:
+        correlations = {}
+        for col in numeric_features.columns:
+            corr = np.abs(X[col].corr(y))
+            if not pd.isna(corr):
+                correlations[col] = corr
+        
+        if correlations:
+            sorted_corrs = dict(sorted(correlations.items(), key=lambda x: x[1], reverse=True)[:10])
+            analysis['top_correlated_features'] = sorted_corrs
     
-    elif method == 'variance':
-        # Feature variance
-        variances = []
-        for col in X.columns:
-            if pd.api.types.is_numeric_dtype(X[col]):
-                variances.append(X[col].var())
-            else:
-                variances.append(0)
-        importance_df['importance'] = variances
-        importance_df['method'] = 'variance'
+    return analysis
+
+
+def save_pipeline(pipeline, filepath):
+    """
+    Save pipeline to disk.
     
-    elif method == 'mutual_info' and y is not None:
-        # Mutual information with target
-        from sklearn.feature_selection import mutual_info_classif
-        try:
-            X_numeric = X.select_dtypes(include=[np.number])
-            mi_scores = mutual_info_classif(X_numeric, y, random_state=42)
-            
-            # Create full importance array
-            full_scores = np.zeros(len(X.columns))
-            numeric_idx = 0
-            for i, col in enumerate(X.columns):
-                if col in X_numeric.columns:
-                    full_scores[i] = mi_scores[numeric_idx]
-                    numeric_idx += 1
-            
-            importance_df['importance'] = full_scores
-            importance_df['method'] = 'mutual_info'
-        except:
-            importance_df['importance'] = 0
-            importance_df['method'] = 'mutual_info_failed'
+    Parameters:
+    -----------
+    pipeline : Pipeline object
+    filepath : str, path to save pipeline
+    """
+    import joblib
+    joblib.dump(pipeline, filepath)
+    print(f"✅ Pipeline saved to: {filepath}")
+
+
+def load_pipeline(filepath):
+    """
+    Load pipeline from disk.
     
-    # Sort by importance
-    importance_df = importance_df.sort_values('importance', ascending=False).reset_index(drop=True)
+    Parameters:
+    -----------
+    filepath : str, path to pipeline file
     
-    return importance_df
+    Returns:
+    --------
+    pipeline : loaded Pipeline object
+    """
+    import joblib
+    return joblib.load(filepath)
