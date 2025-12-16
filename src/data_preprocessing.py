@@ -9,32 +9,23 @@ import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import (
-    OneHotEncoder,
-    StandardScaler,
-    MinMaxScaler
-)
+from sklearn.preprocessing import OneHotEncoder, StandardScaler, MinMaxScaler
 from xverse.transformer import WOE
 
+# -------------------------------------------------------------
+# 1. UTILITY FUNCTION
+# -------------------------------------------------------------
+def mode_or_nan(x):
+    """Return mode or np.nan if empty"""
+    m = x.mode()
+    return m[0] if not m.empty else np.nan
 
 # -------------------------------------------------------------
-# 1. CUSTOMER AGGREGATION FEATURES
+# 2. CUSTOMER AGGREGATION FEATURES
 # -------------------------------------------------------------
 class AggregateFeatures(BaseEstimator, TransformerMixin):
-    """
-    Creates customer-level aggregate features from transaction data.
-    """
-
-    def __init__(self, customer_id_col, amount_col, 
-                 categorical_cols=None, numeric_cols=None):
-        """
-        Parameters:
-        -----------
-        customer_id_col : str, column name for customer identifier
-        amount_col : str, column name for transaction amount
-        categorical_cols : list, categorical columns to preserve
-        numeric_cols : list, numeric columns to preserve
-        """
+    """Creates customer-level aggregate features from transaction data."""
+    def __init__(self, customer_id_col, amount_col, categorical_cols=None, numeric_cols=None):
         self.customer_id_col = customer_id_col
         self.amount_col = amount_col
         self.categorical_cols = categorical_cols or []
@@ -46,62 +37,37 @@ class AggregateFeatures(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         X = X.copy()
-        
-        # Prepare aggregation dictionary
         agg_dict = {}
-        
-        # 1. Amount statistics
         agg_dict[self.amount_col] = ['sum', 'mean', 'count', 'std', 'min', 'max', 'median']
-        
-        # 2. Categorical columns - take mode (most frequent)
+
         for col in self.categorical_cols:
             if col in X.columns and col != self.customer_id_col:
-                agg_dict[col] = lambda x: x.mode()[0] if not x.mode().empty else np.nan
-        
-        # 3. Other numeric columns - statistics
+                agg_dict[col] = mode_or_nan
+
         for col in self.numeric_cols:
             if col in X.columns and col != self.amount_col and col != self.customer_id_col:
                 agg_dict[col] = ['mean', 'std', 'min', 'max', 'sum']
-        
-        # Perform aggregation
+
         result = X.groupby(self.customer_id_col).agg(agg_dict)
-        
-        # Flatten multi-level columns
         result.columns = ['_'.join(col).strip('_') for col in result.columns.values]
         result = result.reset_index()
-        
-        # Create derived features
+
         if f'{self.amount_col}_sum' in result.columns and f'{self.amount_col}_count' in result.columns:
-            # Average transaction value
-            result[f'{self.amount_col}_avg_value'] = (
-                result[f'{self.amount_col}_sum'] / result[f'{self.amount_col}_count']
-            )
-        
-        # Handle infinite values
+            result[f'{self.amount_col}_avg_value'] = result[f'{self.amount_col}_sum'] / result[f'{self.amount_col}_count']
+
         result = result.replace([np.inf, -np.inf], np.nan)
-        
         self.feature_names_ = result.columns.tolist()
-        
         return result
 
     def get_feature_names(self):
         return self.feature_names_
 
-
 # -------------------------------------------------------------
-# 2. DATE FEATURE EXTRACTION
+# 3. DATE FEATURE EXTRACTION
 # -------------------------------------------------------------
 class ExtractDateFeatures(BaseEstimator, TransformerMixin):
-    """
-    Extracts features from datetime columns.
-    """
-
+    """Extracts features from datetime columns."""
     def __init__(self, date_col):
-        """
-        Parameters:
-        -----------
-        date_col : str, column name for datetime
-        """
         self.date_col = date_col
         self.feature_names_ = None
 
@@ -110,106 +76,69 @@ class ExtractDateFeatures(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         X = X.copy()
-        
-        # Convert to datetime
         X[self.date_col] = pd.to_datetime(X[self.date_col], errors='coerce')
-        
-        # Extract basic date features
+
         X['transaction_hour'] = X[self.date_col].dt.hour
         X['transaction_day'] = X[self.date_col].dt.day
         X['transaction_month'] = X[self.date_col].dt.month
         X['transaction_year'] = X[self.date_col].dt.year
         X['transaction_dayofweek'] = X[self.date_col].dt.dayofweek
         X['transaction_quarter'] = X[self.date_col].dt.quarter
-        
-        # Create derived features
+
         X['is_weekend'] = X['transaction_dayofweek'].isin([5, 6]).astype(int)
         X['is_business_hours'] = ((X['transaction_hour'] >= 9) & (X['transaction_hour'] <= 17)).astype(int)
-        
-        # Time period features
         X['is_morning'] = ((X['transaction_hour'] >= 6) & (X['transaction_hour'] < 12)).astype(int)
         X['is_afternoon'] = ((X['transaction_hour'] >= 12) & (X['transaction_hour'] < 18)).astype(int)
         X['is_evening'] = ((X['transaction_hour'] >= 18) & (X['transaction_hour'] < 24)).astype(int)
         X['is_night'] = ((X['transaction_hour'] >= 0) & (X['transaction_hour'] < 6)).astype(int)
-        
-        # Drop original date column
+
         X = X.drop(columns=[self.date_col])
-        
         self.feature_names_ = X.columns.tolist()
-        
         return X
 
     def get_feature_names(self):
         return self.feature_names_
 
-
 # -------------------------------------------------------------
-# 3. OUTLIER REMOVER (IQR Method)
+# 4. OUTLIER REMOVER (IQR Method)
 # -------------------------------------------------------------
 class RemoveOutliers(BaseEstimator, TransformerMixin):
-    """
-    Removes outliers using IQR method.
-    """
-
+    """Removes outliers using IQR method."""
     def __init__(self, factor=1.5):
-        """
-        Parameters:
-        -----------
-        factor : float, IQR multiplier for outlier detection
-        """
         self.factor = factor
         self.bounds_ = {}
         self.feature_names_ = None
 
     def fit(self, X, y=None):
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-        
         for col in numeric_cols:
             Q1 = X[col].quantile(0.25)
             Q3 = X[col].quantile(0.75)
             IQR = Q3 - Q1
-            
-            lower = Q1 - self.factor * IQR
-            upper = Q3 + self.factor * IQR
-            
-            self.bounds_[col] = (lower, upper)
-        
+            self.bounds_[col] = (Q1 - self.factor * IQR, Q3 + self.factor * IQR)
         self.feature_names_ = X.columns.tolist()
         return self
 
     def transform(self, X):
         X = X.copy()
-        
-        # Create a mask for rows to keep
         keep_mask = pd.Series(True, index=X.index)
-        
         for col, (lower, upper) in self.bounds_.items():
             if col in X.columns:
-                col_mask = (X[col] >= lower) & (X[col] <= upper)
-                keep_mask = keep_mask & col_mask
-        
-        # Remove outliers
+                keep_mask &= (X[col] >= lower) & (X[col] <= upper)
         X_clean = X[keep_mask].copy()
-        
         removed_count = len(X) - len(X_clean)
         if removed_count > 0:
-            print(f"  Outlier removal: {removed_count} rows removed "
-                  f"({(removed_count / len(X) * 100):.1f}%)")
-        
+            print(f"  Outlier removal: {removed_count} rows removed ({(removed_count / len(X) * 100):.1f}%)")
         return X_clean
 
     def get_feature_names(self):
         return self.feature_names_
 
-
 # -------------------------------------------------------------
-# 4. FEATURE ENGINEERING
+# 5. FEATURE ENGINEERING
 # -------------------------------------------------------------
 class FeatureEngineering(BaseEstimator, TransformerMixin):
-    """
-    Creates additional engineered features.
-    """
-
+    """Creates additional engineered features."""
     def __init__(self):
         self.feature_names_ = None
 
@@ -218,64 +147,40 @@ class FeatureEngineering(BaseEstimator, TransformerMixin):
 
     def transform(self, X):
         X = X.copy()
-        
-        # Amount-related features
         amount_cols = [col for col in X.columns if 'Amount' in col and 'sum' in col]
         for amount_col in amount_cols:
-            col_prefix = amount_col.replace('_sum', '')
-            
-            # Create ratio features if we have count
             count_col = amount_col.replace('sum', 'count')
             if count_col in X.columns:
-                X[f'{col_prefix}_avg_per_transaction'] = X[amount_col] / X[count_col]
-        
-        # Time pattern features
+                X[f'{amount_col.replace("_sum", "")}_avg_per_transaction'] = X[amount_col] / X[count_col]
+
         time_cols = [col for col in X.columns if any(time in col for time in ['hour', 'day', 'month', 'year'])]
         for time_col in time_cols:
             if '_std' in time_col:
-                # Calculate consistency metric
                 base_col = time_col.replace('_std', '')
                 mean_col = f'{base_col}_mean'
                 if mean_col in X.columns:
                     X[f'{base_col}_consistency'] = 1 / (X[time_col] + 1)
-        
-        # Behavioral features
+
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
         for col in numeric_cols:
             if '_std' in col:
                 mean_col = col.replace('_std', '_mean')
                 if mean_col in numeric_cols:
-                    # Coefficient of variation
                     X[f'{col.replace("_std", "")}_cv'] = X[col] / (X[mean_col] + 1e-10)
-        
-        # Fill any NaN values from calculations
+
         X = X.fillna(0)
-        
         self.feature_names_ = X.columns.tolist()
-        
         return X
 
     def get_feature_names(self):
         return self.feature_names_
 
-
 # -------------------------------------------------------------
-# 5. WOE TRANSFORMER (Weight of Evidence & Information Value)
+# 6. WOE TRANSFORMER
 # -------------------------------------------------------------
 class WoEFeatureTransformer(BaseEstimator, TransformerMixin):
-    """
-    Applies Weight of Evidence (WoE) transformation and computes IV.
-    """
-
+    """Applies Weight of Evidence (WoE) transformation and computes IV."""
     def __init__(self, target_col=None, iv_threshold=0.02, max_bins=5, min_bin_pct=0.05):
-        """
-        Parameters:
-        -----------
-        target_col : str, column name for target variable (optional)
-        iv_threshold : float, minimum IV to keep feature
-        max_bins : int, maximum number of bins
-        min_bin_pct : float, minimum percentage of observations per bin
-        """
         self.target_col = target_col
         self.iv_threshold = iv_threshold
         self.max_bins = max_bins
@@ -285,51 +190,34 @@ class WoEFeatureTransformer(BaseEstimator, TransformerMixin):
         self.iv_summary_ = None
 
     def fit(self, X, y=None):
-        # If target is provided separately
-        if y is not None:
-            target = y
-        # If target column is specified in X
-        elif self.target_col and self.target_col in X.columns:
-            target = X[self.target_col]
-            X = X.drop(columns=[self.target_col])
-        # No target available
-        else:
-            print("⚠️  No target provided for WoE transformation. Skipping WoE.")
-            self.woe_ = None
+        target = y if y is not None else (X[self.target_col] if self.target_col in X.columns else None)
+        if target is None:
+            print("⚠️  No target provided for WoE. Skipping.")
             self.feature_names_ = X.columns.tolist()
             return self
-        
-        # Initialize and fit WoE transformer
-        self.woe_ = WOE(
-            iv_threshold=self.iv_threshold,
-            max_bins=self.max_bins,
-            min_bin_pct=self.min_bin_pct
-        )
-        
+
+        X_ = X.drop(columns=[self.target_col]) if self.target_col in X.columns else X
+        self.woe_ = WOE(iv_threshold=self.iv_threshold, max_bins=self.max_bins, min_bin_pct=self.min_bin_pct)
+
         try:
-            self.woe_.fit(X, target)
-            self.iv_summary_ = self.woe_.iv_df_ if hasattr(self.woe_, 'iv_df_') else None
-            self.feature_names_ = X.columns.tolist()
-            print(f"✅ WoE fitting successful. {len(self.iv_summary_) if self.iv_summary_ is not None else 0} features processed.")
+            self.woe_.fit(X_, target)
+            self.iv_summary_ = getattr(self.woe_, 'iv_df_', None)
+            self.feature_names_ = X_.columns.tolist()
+            print(f"✅ WoE fitting successful.")
         except Exception as e:
             print(f"⚠️  WoE fitting failed: {e}. Skipping WoE.")
             self.woe_ = None
-            self.feature_names_ = X.columns.tolist()
-        
+            self.feature_names_ = X_.columns.tolist()
+
         return self
 
     def transform(self, X):
         if self.woe_ is None:
             return X
-        
+        X_ = X.drop(columns=[self.target_col]) if self.target_col in X.columns else X
         try:
-            # If target column exists in X, remove it
-            if self.target_col and self.target_col in X.columns:
-                X = X.drop(columns=[self.target_col])
-            
-            transformed = self.woe_.transform(X)
+            transformed = self.woe_.transform(X_)
             self.feature_names_ = transformed.columns.tolist()
-            
             print(f"✅ WoE transformation applied.")
             return transformed
         except Exception as e:
@@ -340,14 +228,49 @@ class WoEFeatureTransformer(BaseEstimator, TransformerMixin):
         return self.feature_names_
 
     def get_iv_summary(self):
-        """
-        Returns Information Value (IV) summary if available.
-        """
         return self.iv_summary_
 
+# -------------------------------------------------------------
+# 7. DYNAMIC PREPROCESSOR (MODULE LEVEL!)
+# -------------------------------------------------------------
+class DynamicPreprocessor(BaseEstimator, TransformerMixin):
+    """Automatic numeric/categorical scaling and encoding."""
+    def __init__(self, scaling_method='standard'):
+        self.scaling_method = scaling_method
+        self.preprocessor_ = None
+        self.feature_names_ = None
+
+    def fit(self, X, y=None):
+        numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
+        for col in ['CustomerId', 'customer_id']:
+            if col in categorical_features:
+                categorical_features.remove(col)
+
+        transformers = []
+        if numeric_features:
+            scaler = StandardScaler() if self.scaling_method == 'standard' else MinMaxScaler()
+            transformers.append(('num', scaler, numeric_features))
+        if categorical_features:
+            transformers.append(('cat', OneHotEncoder(handle_unknown='ignore', sparse_output=False, drop='first'), categorical_features))
+
+        if transformers:
+            self.preprocessor_ = ColumnTransformer(transformers=transformers, remainder='drop')
+            self.preprocessor_.fit(X)
+            self.feature_names_ = self.preprocessor_.get_feature_names_out().tolist() if hasattr(self.preprocessor_, 'get_feature_names_out') else []
+
+        return self
+
+    def transform(self, X):
+        if self.preprocessor_ is None:
+            return X
+        return self.preprocessor_.transform(X)
+
+    def get_feature_names(self):
+        return self.feature_names_
 
 # -------------------------------------------------------------
-# 6. MAIN FEATURE ENGINEERING PIPELINE BUILDER
+# 8. PIPELINE BUILDER
 # -------------------------------------------------------------
 def build_feature_engineering_pipeline(
     customer_id_col='CustomerId',
@@ -360,171 +283,42 @@ def build_feature_engineering_pipeline(
     remove_outliers=True,
     scaling_method='standard'
 ):
-    """
-    Builds complete feature engineering pipeline following Task 3 requirements.
-    
-    Parameters:
-    -----------
-    customer_id_col : str, column name for customer ID
-    amount_col : str, column name for transaction amount
-    date_col : str, column name for transaction date
-    categorical_cols : list, categorical columns to encode
-    numeric_cols : list, numeric columns to scale
-    use_woe : bool, whether to apply WoE transformation
-    woe_target_col : str, target column name for WoE
-    remove_outliers : bool, whether to remove outliers
-    scaling_method : str, 'standard' or 'minmax'
-    
-    Returns:
-    --------
-    pipeline : sklearn Pipeline object
-    """
-    
-    if categorical_cols is None:
-        categorical_cols = []
-    if numeric_cols is None:
-        numeric_cols = []
-    
-    # Build the pipeline steps
-    steps = []
-    
-    # Step 1: Extract date features
-    steps.append(('extract_date_features', ExtractDateFeatures(date_col)))
-    
-    # Step 2: Customer aggregation
-    steps.append(('aggregate_features', AggregateFeatures(
-        customer_id_col=customer_id_col,
-        amount_col=amount_col,
-        categorical_cols=categorical_cols,
-        numeric_cols=numeric_cols
-    )))
-    
-    # Step 3: Feature engineering
-    steps.append(('feature_engineering', FeatureEngineering()))
-    
-    # Step 4: Remove outliers (optional)
+    steps = [
+        ('extract_date_features', ExtractDateFeatures(date_col)),
+        ('aggregate_features', AggregateFeatures(customer_id_col, amount_col, categorical_cols, numeric_cols)),
+        ('feature_engineering', FeatureEngineering())
+    ]
+
     if remove_outliers:
         steps.append(('remove_outliers', RemoveOutliers()))
-    
-    # Step 5: Create preprocessing for encoding and scaling
-    # After aggregation, we need to identify which columns are numeric/categorical
-    # We'll create a ColumnTransformer that dynamically adapts
-    
-    # First, create a temporary transformer to get column types
-    class DynamicPreprocessor(BaseEstimator, TransformerMixin):
-        def __init__(self, scaling_method='standard'):
-            self.scaling_method = scaling_method
-            self.preprocessor_ = None
-            self.feature_names_ = None
-            
-        def fit(self, X, y=None):
-            # Identify column types
-            numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
-            categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
-            
-            # Remove customer_id from features if present
-            customer_id_cols = [col for col in ['CustomerId', 'customer_id'] if col in categorical_features]
-            for col in customer_id_cols:
-                categorical_features.remove(col)
-            
-            # Create transformers
-            transformers = []
-            
-            if numeric_features:
-                scaler = StandardScaler() if self.scaling_method == 'standard' else MinMaxScaler()
-                transformers.append(('num', scaler, numeric_features))
-            
-            if categorical_features:
-                transformers.append(('cat', OneHotEncoder(
-                    handle_unknown='ignore',
-                    sparse_output=False,
-                    drop='first'
-                ), categorical_features))
-            
-            # Create ColumnTransformer
-            if transformers:
-                self.preprocessor_ = ColumnTransformer(
-                    transformers=transformers,
-                    remainder='drop'  # Drop other columns (like CustomerId)
-                )
-                self.preprocessor_.fit(X)
-                
-                # Get feature names after transformation
-                if hasattr(self.preprocessor_, 'get_feature_names_out'):
-                    self.feature_names_ = self.preprocessor_.get_feature_names_out()
-                else:
-                    # Fallback for older sklearn versions
-                    self.feature_names_ = []
-            
-            return self
-        
-        def transform(self, X):
-            if self.preprocessor_ is None:
-                return X
-            return self.preprocessor_.transform(X)
-        
-        def get_feature_names(self):
-            return self.feature_names_
-    
+
     steps.append(('preprocessing', DynamicPreprocessor(scaling_method=scaling_method)))
-    
-    # Step 6: WoE transformation (optional)
+
     if use_woe:
         steps.append(('woe_transformer', WoEFeatureTransformer(target_col=woe_target_col)))
-    
+
     return Pipeline(steps)
 
-
 # -------------------------------------------------------------
-# 7. UTILITY FUNCTIONS
+# 9. UTILITY FUNCTIONS
 # -------------------------------------------------------------
 def get_feature_names_from_pipeline(pipeline, X_sample):
-    """
-    Extract feature names from pipeline after transformation.
-    
-    Parameters:
-    -----------
-    pipeline : fitted Pipeline object
-    X_sample : DataFrame, sample data
-    
-    Returns:
-    --------
-    feature_names : list of feature names
-    """
-    # Transform data through each step to get feature names
     X_transformed = X_sample.copy()
     feature_names = None
-    
-    for step_name, transformer in pipeline.steps:
+    for _, transformer in pipeline.steps:
         if hasattr(transformer, 'transform'):
             X_transformed = transformer.transform(X_transformed)
             if hasattr(transformer, "get_feature_names_out"):
                 names = transformer.get_feature_names_out()
                 if names is not None and len(names) > 0:
                     feature_names = names.tolist()
-
             elif hasattr(transformer, "get_feature_names"):
                 names = transformer.get_feature_names()
                 if names is not None and len(names) > 0:
                     feature_names = list(names)
-
-    
     return feature_names
 
-
 def analyze_features(X, y=None):
-    """
-    Analyze engineered features.
-    
-    Parameters:
-    -----------
-    X : DataFrame, features
-    y : Series, target (optional)
-    
-    Returns:
-    --------
-    analysis_dict : dictionary with analysis results
-    """
     analysis = {
         'total_features': X.shape[1],
         'numeric_features': X.select_dtypes(include=[np.number]).shape[1],
@@ -533,54 +327,21 @@ def analyze_features(X, y=None):
         'data_shape': X.shape,
         'missing_values': X.isnull().sum().sum()
     }
-    
-    # Add variance analysis for numeric features
     numeric_features = X.select_dtypes(include=[np.number])
     if not numeric_features.empty:
         variances = numeric_features.var().sort_values(ascending=False)
         analysis['top_variance_features'] = variances.head(10).to_dict()
         analysis['total_variance'] = variances.sum()
-    
-    # Add correlation analysis if target is provided
     if y is not None and not numeric_features.empty:
-        correlations = {}
-        for col in numeric_features.columns:
-            corr = np.abs(X[col].corr(y))
-            if not pd.isna(corr):
-                correlations[col] = corr
-        
-        if correlations:
-            sorted_corrs = dict(sorted(correlations.items(), key=lambda x: x[1], reverse=True)[:10])
-            analysis['top_correlated_features'] = sorted_corrs
-    
+        correlations = {col: abs(X[col].corr(y)) for col in numeric_features.columns if not pd.isna(X[col].corr(y))}
+        analysis['top_correlated_features'] = dict(sorted(correlations.items(), key=lambda x: x[1], reverse=True)[:10])
     return analysis
 
-
 def save_pipeline(pipeline, filepath):
-    """
-    Save pipeline to disk.
-    
-    Parameters:
-    -----------
-    pipeline : Pipeline object
-    filepath : str, path to save pipeline
-    """
     import joblib
     joblib.dump(pipeline, filepath)
     print(f"✅ Pipeline saved to: {filepath}")
 
-
 def load_pipeline(filepath):
-    """
-    Load pipeline from disk.
-    
-    Parameters:
-    -----------
-    filepath : str, path to pipeline file
-    
-    Returns:
-    --------
-    pipeline : loaded Pipeline object
-    """
     import joblib
     return joblib.load(filepath)
