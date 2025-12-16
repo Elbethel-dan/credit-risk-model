@@ -17,42 +17,45 @@ from sklearn.preprocessing import (
 from xverse.transformer import WOE
 
 
+
 # -------------------------------------------------------------
-# 1. DYNAMIC PREPROCESSOR (Moved outside function)
+# 1. DYNAMIC PREPROCESSOR (UPDATED TO RETURN DATAFRAME)
 # -------------------------------------------------------------
 class DynamicPreprocessor(BaseEstimator, TransformerMixin):
     """
-    Dynamic preprocessor that adapts to column types.
+    Dynamic preprocessor that adapts to column types and returns DataFrame.
     """
     
     def __init__(self, scaling_method='standard'):
         self.scaling_method = scaling_method
         self.preprocessor_ = None
         self.feature_names_ = None
+        self.numeric_features_ = None
+        self.categorical_features_ = None
         
     def fit(self, X, y=None):
         # Identify column types
-        numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
-        categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
+        self.numeric_features_ = X.select_dtypes(include=[np.number]).columns.tolist()
+        self.categorical_features_ = X.select_dtypes(exclude=[np.number]).columns.tolist()
         
         # Remove customer_id from features if present
-        customer_id_cols = [col for col in ['CustomerId', 'customer_id'] if col in categorical_features]
+        customer_id_cols = [col for col in ['CustomerId', 'customer_id'] if col in self.categorical_features_]
         for col in customer_id_cols:
-            categorical_features.remove(col)
+            self.categorical_features_.remove(col)
         
         # Create transformers
         transformers = []
         
-        if numeric_features:
+        if self.numeric_features_:
             scaler = StandardScaler() if self.scaling_method == 'standard' else MinMaxScaler()
-            transformers.append(('num', scaler, numeric_features))
+            transformers.append(('num', scaler, self.numeric_features_))
         
-        if categorical_features:
+        if self.categorical_features_:
             transformers.append(('cat', OneHotEncoder(
                 handle_unknown='ignore',
                 sparse_output=False,
                 drop='first'
-            ), categorical_features))
+            ), self.categorical_features_))
         
         # Create ColumnTransformer
         if transformers:
@@ -65,19 +68,38 @@ class DynamicPreprocessor(BaseEstimator, TransformerMixin):
             # Get feature names after transformation
             if hasattr(self.preprocessor_, 'get_feature_names_out'):
                 self.feature_names_ = self.preprocessor_.get_feature_names_out()
-            else:
-                # Fallback for older sklearn versions
-                self.feature_names_ = []
         
         return self
     
     def transform(self, X):
         if self.preprocessor_ is None:
             return X
-        return self.preprocessor_.transform(X)
+        
+        # Transform data
+        transformed_data = self.preprocessor_.transform(X)
+        
+        # Convert to DataFrame with proper column names
+        if self.feature_names_ is not None:
+            # Create DataFrame with feature names
+            result_df = pd.DataFrame(
+                transformed_data,
+                columns=self.feature_names_,
+                index=X.index if hasattr(X, 'index') else None
+            )
+        else:
+            # Fallback: Create generic DataFrame
+            result_df = pd.DataFrame(
+                transformed_data,
+                index=X.index if hasattr(X, 'index') else None
+            )
+        
+        return result_df
     
     def get_feature_names(self):
-        return self.feature_names_
+        if self.feature_names_ is not None:
+            return self.feature_names_.tolist()
+        return None
+
 
 
 # -------------------------------------------------------------
@@ -421,7 +443,8 @@ def build_feature_engineering_pipeline(
     use_woe=False,
     woe_target_col=None,
     remove_outliers=True,
-    scaling_method='standard'
+    scaling_method='standard',
+    return_dataframe=True
 ):
     """
     Builds complete feature engineering pipeline following Task 3 requirements.
@@ -437,6 +460,7 @@ def build_feature_engineering_pipeline(
     woe_target_col : str, target column name for WoE
     remove_outliers : bool, whether to remove outliers
     scaling_method : str, 'standard' or 'minmax'
+    return_dataframe : bool, whether to return DataFrame instead of numpy array
     
     Returns:
     --------
@@ -476,6 +500,29 @@ def build_feature_engineering_pipeline(
     if use_woe:
         steps.append(('woe_transformer', WoEFeatureTransformer(target_col=woe_target_col)))
     
+    # Create a wrapper to ensure DataFrame output
+    if return_dataframe:
+        class DataFrameWrapper(BaseEstimator, TransformerMixin):
+            def fit(self, X, y=None):
+                return self
+            def transform(self, X):
+                # Ensure output is DataFrame
+                if isinstance(X, np.ndarray):
+                    # Try to get feature names from previous step
+                    feature_names = None
+                    for step in reversed(steps):
+                        if hasattr(step[1], 'get_feature_names'):
+                            feature_names = step[1].get_feature_names()
+                            break
+                    
+                    if feature_names and len(feature_names) == X.shape[1]:
+                        return pd.DataFrame(X, columns=feature_names)
+                    else:
+                        return pd.DataFrame(X, columns=[f'feature_{i}' for i in range(X.shape[1])])
+                return X
+        
+        steps.append(('dataframe_wrapper', DataFrameWrapper()))
+    
     return Pipeline(steps)
 
 
@@ -485,15 +532,6 @@ def build_feature_engineering_pipeline(
 def get_feature_names_from_pipeline(pipeline, X_sample):
     """
     Extract feature names from pipeline after transformation.
-    
-    Parameters:
-    -----------
-    pipeline : fitted Pipeline object
-    X_sample : DataFrame, sample data
-    
-    Returns:
-    --------
-    feature_names : list of feature names
     """
     # Transform data through each step to get feature names
     X_transformed = X_sample.copy()
@@ -501,89 +539,29 @@ def get_feature_names_from_pipeline(pipeline, X_sample):
     
     for step_name, transformer in pipeline.steps:
         if hasattr(transformer, 'transform'):
-            X_transformed = transformer.transform(X_transformed)
-            if hasattr(transformer, "get_feature_names_out"):
-                names = transformer.get_feature_names_out()
-                if names is not None and len(names) > 0:
-                    feature_names = names.tolist()
-
-            elif hasattr(transformer, "get_feature_names"):
+            try:
+                X_transformed = transformer.transform(X_transformed)
+            except Exception as e:
+                continue
+            
+            # Try to get feature names
+            if hasattr(transformer, 'get_feature_names'):
                 names = transformer.get_feature_names()
-                if names is not None and len(names) > 0:
-                    feature_names = list(names)
+                if names is not None:
+                    if isinstance(names, np.ndarray):
+                        feature_names = names.tolist()
+                    elif isinstance(names, list):
+                        feature_names = names
+            elif isinstance(X_transformed, pd.DataFrame):
+                feature_names = X_transformed.columns.tolist()
     
     return feature_names
-
-
-def analyze_features(X, y=None):
-    """
-    Analyze engineered features.
-    
-    Parameters:
-    -----------
-    X : DataFrame, features
-    y : Series, target (optional)
-    
-    Returns:
-    --------
-    analysis_dict : dictionary with analysis results
-    """
-    analysis = {
-        'total_features': X.shape[1],
-        'numeric_features': X.select_dtypes(include=[np.number]).shape[1],
-        'categorical_features': X.select_dtypes(exclude=[np.number]).shape[1],
-        'feature_names': X.columns.tolist(),
-        'data_shape': X.shape,
-        'missing_values': X.isnull().sum().sum()
-    }
-    
-    # Add variance analysis for numeric features
-    numeric_features = X.select_dtypes(include=[np.number])
-    if not numeric_features.empty:
-        variances = numeric_features.var().sort_values(ascending=False)
-        analysis['top_variance_features'] = variances.head(10).to_dict()
-        analysis['total_variance'] = variances.sum()
-    
-    # Add correlation analysis if target is provided
-    if y is not None and not numeric_features.empty:
-        correlations = {}
-        for col in numeric_features.columns:
-            corr = np.abs(X[col].corr(y))
-            if not pd.isna(corr):
-                correlations[col] = corr
-        
-        if correlations:
-            sorted_corrs = dict(sorted(correlations.items(), key=lambda x: x[1], reverse=True)[:10])
-            analysis['top_correlated_features'] = sorted_corrs
-    
-    return analysis
 
 
 def save_pipeline(pipeline, filepath):
     """
     Save pipeline to disk.
-    
-    Parameters:
-    -----------
-    pipeline : Pipeline object
-    filepath : str, path to save pipeline
     """
     import joblib
     joblib.dump(pipeline, filepath)
     print(f"✅ Pipeline saved to: {filepath}")
-
-
-def load_pipeline(filepath):
-    """
-    Load pipeline from disk.
-    
-    Parameters:
-    -----------
-    filepath : str, path to pipeline file
-    
-    Returns:
-    --------
-    pipeline : loaded Pipeline object
-    """
-    import joblib
-    return joblib.load(filepath)
