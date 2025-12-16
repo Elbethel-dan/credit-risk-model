@@ -502,12 +502,15 @@ def get_feature_names_from_pipeline(pipeline, X_sample):
     for step_name, transformer in pipeline.steps:
         if hasattr(transformer, 'transform'):
             X_transformed = transformer.transform(X_transformed)
-            if hasattr(transformer, 'get_feature_names'):
+            if hasattr(transformer, "get_feature_names_out"):
+                names = transformer.get_feature_names_out()
+                if names is not None and len(names) > 0:
+                    feature_names = names.tolist()
+
+            elif hasattr(transformer, "get_feature_names"):
                 names = transformer.get_feature_names()
-                if names:
-                    feature_names = names
-            elif isinstance(X_transformed, pd.DataFrame):
-                feature_names = X_transformed.columns.tolist()
+                if names is not None and len(names) > 0:
+                    feature_names = list(names)
     
     return feature_names
 
