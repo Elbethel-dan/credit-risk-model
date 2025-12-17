@@ -25,73 +25,73 @@ class DynamicPreprocessor(BaseEstimator, TransformerMixin):
     Dynamic preprocessor that adapts to column types and returns DataFrame.
     """
     
-    def __init__(self, scaling_method='standard'):
+    def __init__(self, scaling_method='standard', id_cols=None):
         self.scaling_method = scaling_method
+        self.id_cols = id_cols or []
         self.preprocessor_ = None
         self.feature_names_ = None
+
         
     def fit(self, X, y=None):
-        # Identify column types
+    # Identify column types
         numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
         categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
-        
-        # Remove customer_id from features if present
-        customer_id_cols = [col for col in ['CustomerId', 'customer_id'] if col in categorical_features]
-        for col in customer_id_cols:
-            categorical_features.remove(col)
-        
-        # Create transformers
+
+        # Remove ID columns from feature lists
+        for col in self.id_cols:
+            if col in numeric_features:
+                numeric_features.remove(col)
+            if col in categorical_features:
+                categorical_features.remove(col)
+
         transformers = []
-        
+
         if numeric_features:
             scaler = StandardScaler() if self.scaling_method == 'standard' else MinMaxScaler()
             transformers.append(('num', scaler, numeric_features))
-        
+
         if categorical_features:
             transformers.append(('cat', OneHotEncoder(
                 handle_unknown='ignore',
                 sparse_output=False,
                 drop='first'
             ), categorical_features))
-        
-        # Create ColumnTransformer
-        if transformers:
-            self.preprocessor_ = ColumnTransformer(
-                transformers=transformers,
-                remainder='drop'
-            )
-            self.preprocessor_.fit(X)
-            
-            # Get feature names after transformation
-            if hasattr(self.preprocessor_, 'get_feature_names_out'):
-                self.feature_names_ = self.preprocessor_.get_feature_names_out()
-        
+
+        self.numeric_features_ = numeric_features
+        self.categorical_features_ = categorical_features
+
+        self.preprocessor_ = ColumnTransformer(
+            transformers=transformers,
+            remainder='drop'
+        )
+
+        self.preprocessor_.fit(X)
+        self.feature_names_ = self.preprocessor_.get_feature_names_out()
+
         return self
+
     
     def transform(self, X):
-        if self.preprocessor_ is None:
-            return X
-        
-        # Transform data
-        transformed_data = self.preprocessor_.transform(X)
-        
-        # Convert to DataFrame with proper column names
-        if self.feature_names_ is not None:
-            return pd.DataFrame(
-                transformed_data,
-                columns=self.feature_names_,
-                index=X.index if hasattr(X, 'index') else None
-            )
-        else:
-            return pd.DataFrame(
-                transformed_data,
-                index=X.index if hasattr(X, 'index') else None
-            )
-    
-    def get_feature_names(self):
-        if self.feature_names_ is not None:
-            return self.feature_names_.tolist()
-        return None
+        X = X.copy()
+
+        # Preserve IDs
+        ids = X[self.id_cols] if self.id_cols else None
+        X_features = X.drop(columns=self.id_cols, errors='ignore')
+
+        transformed = self.preprocessor_.transform(X_features)
+
+        features_df = pd.DataFrame(
+            transformed,
+            columns=self.feature_names_,
+            index=X.index
+        )
+
+        # Concatenate IDs back
+        if ids is not None:
+            return pd.concat([ids.reset_index(drop=True),
+                            features_df.reset_index(drop=True)], axis=1)
+
+        return features_df
 
 
 # -------------------------------------------------------------
@@ -472,8 +472,9 @@ def build_feature_engineering_pipeline(
         steps.append(('remove_outliers', RemoveOutliers()))
     
     # Step 5: Create preprocessing for encoding and scaling
-    steps.append(('preprocessing', DynamicPreprocessor(scaling_method=scaling_method)))
-    
+    steps.append(('preprocessing', DynamicPreprocessor(scaling_method=scaling_method, id_cols=[customer_id_col]   # ✅ KEEP ID FOR MERGING
+)))
+
     # Step 6: WoE transformation (optional)
     if use_woe:
         steps.append(('woe_transformer', WoEFeatureTransformer(target_col=woe_target_col)))
