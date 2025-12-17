@@ -245,9 +245,10 @@ class ExtractDateFeatures(BaseEstimator, TransformerMixin):
 # -------------------------------------------------------------
 # 5. OUTLIER REMOVER (IQR Method)
 # -------------------------------------------------------------
-class RemoveOutliers(BaseEstimator, TransformerMixin):
+class CapOutliersIQR(BaseEstimator, TransformerMixin):
     """
-    Removes outliers using IQR method.
+    Caps outliers using IQR instead of removing rows.
+    SAFE for supervised learning.
     """
 
     def __init__(self, factor=1.5):
@@ -257,44 +258,31 @@ class RemoveOutliers(BaseEstimator, TransformerMixin):
 
     def fit(self, X, y=None):
         numeric_cols = X.select_dtypes(include=[np.number]).columns.tolist()
-        
+
         for col in numeric_cols:
             Q1 = X[col].quantile(0.25)
             Q3 = X[col].quantile(0.75)
             IQR = Q3 - Q1
-            
+
             lower = Q1 - self.factor * IQR
             upper = Q3 + self.factor * IQR
-            
+
             self.bounds_[col] = (lower, upper)
-        
+
         self.feature_names_ = X.columns.tolist()
         return self
 
     def transform(self, X):
         X = X.copy()
-        
-        # Create a mask for rows to keep
-        keep_mask = pd.Series(True, index=X.index)
-        
+
         for col, (lower, upper) in self.bounds_.items():
             if col in X.columns:
-                col_mask = (X[col] >= lower) & (X[col] <= upper)
-                keep_mask = keep_mask & col_mask
-        
-        # Remove outliers
-        X_clean = X[keep_mask].copy()
-        
-        removed_count = len(X) - len(X_clean)
-        if removed_count > 0:
-            print(f"  Outlier removal: {removed_count} rows removed "
-                  f"({(removed_count / len(X) * 100):.1f}%)")
-        
-        return X_clean
+                X[col] = X[col].clip(lower, upper)
+
+        return X
 
     def get_feature_names(self):
         return self.feature_names_
-
 
 # -------------------------------------------------------------
 # 6. FEATURE ENGINEERING
@@ -469,7 +457,7 @@ def build_feature_engineering_pipeline(
     
     # Step 4: Remove outliers (optional)
     if remove_outliers:
-        steps.append(('remove_outliers', RemoveOutliers()))
+        steps.append(('cap_outliers', CapOutliersIQR()))
     
     # Step 5: Create preprocessing for encoding and scaling
     steps.append(('preprocessing', DynamicPreprocessor(scaling_method=scaling_method, id_cols=[customer_id_col]   # ✅ KEEP ID FOR MERGING
