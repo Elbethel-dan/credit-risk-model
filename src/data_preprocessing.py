@@ -173,6 +173,10 @@ class AggregateFeatures(BaseEstimator, TransformerMixin):
         
         # Flatten multi-level columns
         result.columns = ['_'.join(col).strip('_') for col in result.columns.values]
+        
+        # **Clean <lambda> from categorical columns**
+        result.columns = [col.replace('<lambda>', '').strip('_') for col in result.columns]
+        
         result = result.reset_index()
         
         # Create derived features
@@ -186,7 +190,8 @@ class AggregateFeatures(BaseEstimator, TransformerMixin):
         
         self.feature_names_ = result.columns.tolist()
         
-        return result
+        return result 
+
 
     def get_feature_names(self):
         return self.feature_names_
